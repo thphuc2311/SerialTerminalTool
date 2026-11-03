@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox, QPushButton,
     QCheckBox, QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QFileDialog, QAction, QToolBar, QLineEdit, QSpinBox, QFrame, QSizePolicy,
-    QMessageBox
+    QMessageBox, QSplitter
 )
 
 try:
@@ -134,7 +134,7 @@ class SerialTerminal(QMainWindow):
     # ------------------------------------------------------------------ #
     # Thân chính: panel trái (Options/Line State/Count) + phải (Receive/Send)
     # ------------------------------------------------------------------ #
-    def _build_body(self):
+    def _build_body(self): # Phương thức tạm thời, chưa dùng splitter
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
@@ -142,10 +142,33 @@ class SerialTerminal(QMainWindow):
         main_layout.addWidget(self._build_left_panel(), 0)
         main_layout.addWidget(self._build_right_panel(), 1)
 
+    def _build_body_StubFunc(self): # Phương thức xây dựng thân chính với splitter
+        splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(splitter)
+
+        left_panel = self._build_left_panel()
+        right_panel = self._build_right_panel()
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+
+        # Panel trái co giãn theo nội dung (không bị kéo giãn khi resize cửa sổ),
+        # panel phải chiếm phần còn lại. Người dùng vẫn có thể kéo thanh chia để
+        # tự chỉnh độ rộng panel trái khi chạy app.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([190, 710])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+
     # ---- Panel trái ---- #
     def _build_left_panel(self):
         panel = QWidget()
-        panel.setFixedWidth(250)
+        panel.setFixedWidth(250) # Fix cứng độ rộng panel trái, chưa dùng splitter
+        # Đặt chiều rộng tối thiểu và chính sách kích thước để panel trái co giãn hợp lý khi dùng splitter
+        # panel.setMinimumWidth(170)
+        # panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        # end thiết lập kích thước panel trái khi dùng splitter
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 4, 4, 4)
 
