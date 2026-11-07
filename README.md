@@ -36,3 +36,7 @@ Nhược điểm: khởi động chậm hơn mỗi lần mở (vài trăm ms đ�
 Kết quả build là một thư mục (dist\SerialTerminal\) chứa file SerialTerminal.exe cùng rất nhiều file .dll, .pyd đi kèm.
 Chạy nhanh hơn vì không cần giải nén — mọi thứ đã nằm sẵn trên đĩa.
 Nhược điểm: phải gửi/copy cả thư mục cho người khác, không gọn bằng 1 file.
+
+Version info:
+v1: only serial view
+v2: update USB frame view
