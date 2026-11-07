@@ -20,8 +20,8 @@ from PyQt5.QtGui import QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox, QPushButton,
     QCheckBox, QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
-    QFileDialog, QAction, QToolBar, QLineEdit, QSpinBox, QFrame, QSizePolicy,
-    QMessageBox, QSplitter
+    QFileDialog, QAction, QActionGroup, QToolBar, QLineEdit, QSpinBox, QFrame,
+    QSizePolicy, QMessageBox, QSplitter, QStackedWidget
 )
 
 try:
@@ -70,6 +70,11 @@ class SerialReaderThread(QThread):
 # Cửa sổ chính
 # --------------------------------------------------------------------------- #
 class SerialTerminal(QMainWindow):
+    # Hằng số khung (frame) protocol USB
+    USB_FRAME_LEN = 12
+    USB_SOF_DATA = 0xA5    # SOF của frame dữ liệu chuẩn
+    USB_SOF_ERROR = 0xEE   # SOF của frame báo lỗi
+
     def __init__(self):
         super().__init__()
         self.ser = None
@@ -79,6 +84,7 @@ class SerialTerminal(QMainWindow):
         self.last_speed_time = time.time()
         self.last_send_count = 0
         self.last_recv_count = 0
+        self._usb_buffer = bytearray()  # buffer gom byte để tách frame USB
 
         self.setWindowTitle("Serial Terminal")
         self.resize(900, 620)
@@ -86,6 +92,13 @@ class SerialTerminal(QMainWindow):
         self._build_toolbar()
         self._build_body()
         self._refresh_ports()
+
+        # Đồng bộ view mặc định = Serial, sau khi stack widget đã được tạo
+        self.act_view_serial.toggled.connect(
+            lambda checked: checked and self.stack_recv.setCurrentIndex(0))
+        self.act_view_usb.toggled.connect(
+            lambda checked: checked and self.stack_recv.setCurrentIndex(1))
+        self.stack_recv.setCurrentIndex(0)
 
         # Timer tính tốc độ gửi/nhận (Byte/s)
         self.speed_timer = QTimer(self)
@@ -117,6 +130,23 @@ class SerialTerminal(QMainWindow):
         self.act_disconnect.triggered.connect(self._on_disconnect)
         self.act_disconnect.setEnabled(False)
         toolbar.addAction(self.act_disconnect)
+
+        toolbar.addSeparator()
+
+        # Nút chuyển đổi View Serial / View USB (loại trừ lẫn nhau, kiểu radio)
+        self.act_view_serial = QAction("View Serial", self)
+        self.act_view_serial.setCheckable(True)
+        self.act_view_usb = QAction("View USB", self)
+        self.act_view_usb.setCheckable(True)
+
+        view_group = QActionGroup(self)
+        view_group.setExclusive(True)
+        view_group.addAction(self.act_view_serial)
+        view_group.addAction(self.act_view_usb)
+        self.act_view_serial.setChecked(True)  # mặc định khởi động: Serial view
+
+        toolbar.addAction(self.act_view_serial)
+        toolbar.addAction(self.act_view_usb)
 
         toolbar.addSeparator()
 
@@ -322,7 +352,16 @@ class SerialTerminal(QMainWindow):
         tail_row.addWidget(self.cmb_tail_recv)
         recv_layout.addLayout(tail_row)
 
-        layout.addWidget(recv_box, 2)
+        # --- USB View (hiển thị frame đã giải mã) ---
+        usb_page = self._build_usb_view()
+
+        # Stack để chuyển đổi Receive Section (Serial view) <-> USB View,
+        # dữ liệu cả 2 bên vẫn luôn được cập nhật ngầm nên chuyển qua lại
+        # không mất dữ liệu đã nhận trước đó.
+        self.stack_recv = QStackedWidget()
+        self.stack_recv.addWidget(recv_box)   # index 0: Serial view
+        self.stack_recv.addWidget(usb_page)   # index 1: USB view
+        layout.addWidget(self.stack_recv, 2)
 
         # --- Send Section ---
         send_box = QGroupBox("Send Section (Byte < 64KB)")
@@ -388,6 +427,134 @@ class SerialTerminal(QMainWindow):
         self._data_file_path = None
         return panel
 
+    # ---- USB View: panel hiển thị frame đã giải mã (dạng card) ---- #
+    def _make_field_card(self, title: str, span_full: bool = False):
+        """Tạo 1 ô 'card' bo góc gồm nhãn nhỏ phía trên + giá trị lớn phía dưới.
+        Trả về (frame_widget, value_label) để nơi gọi giữ tham chiếu value_label."""
+        card = QFrame()
+        card.setObjectName("fieldCard")
+        card.setStyleSheet("""
+            QFrame#fieldCard {
+                background-color: #F5F7F8;
+                border: 1px solid #DDE3E6;
+                border-radius: 10px;
+            }
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 8, 12, 10)
+        card_layout.setSpacing(2)
+
+        lbl_title = QLabel(title.upper())
+        lbl_title.setStyleSheet("""
+            color: #8A97A0;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            border: none;
+        """)
+        card_layout.addWidget(lbl_title)
+
+        lbl_value = QLabel("--")
+        lbl_value.setStyleSheet("""
+            color: #2C3E50;
+            font-size: 17px;
+            font-weight: 700;
+            border: none;
+        """)
+        lbl_value.setFont(QFont("Consolas", 12, QFont.Bold))
+        card_layout.addWidget(lbl_value)
+
+        return card, lbl_value
+
+    def _build_usb_view(self):
+        box = QGroupBox("USB View — Decoded Frame")
+        outer_layout = QVBoxLayout(box)
+        outer_layout.setSpacing(10)
+
+        # --- Banner trạng thái (đổi màu theo kết quả) ---
+        self.frame_usb_status = QFrame()
+        self.frame_usb_status.setObjectName("statusBanner")
+        status_layout = QHBoxLayout(self.frame_usb_status)
+        status_layout.setContentsMargins(14, 10, 14, 10)
+        self.lbl_usb_status = QLabel("Chưa nhận frame nào")
+        self.lbl_usb_status.setStyleSheet("font-size: 14px; font-weight: 700; border: none;")
+        self.lbl_usb_timestamp = QLabel("")
+        self.lbl_usb_timestamp.setStyleSheet("font-size: 11px; color: #5D6D7E; border: none;")
+        status_layout.addWidget(self.lbl_usb_status)
+        status_layout.addStretch()
+        status_layout.addWidget(self.lbl_usb_timestamp)
+        self._set_usb_banner("neutral", "Chưa nhận frame nào", "")
+        outer_layout.addWidget(self.frame_usb_status)
+
+        # --- Lưới card hiển thị các field ---
+        grid = QGridLayout()
+        grid.setSpacing(10)
+
+        card_node, self.lbl_val_nodeid = self._make_field_card("NodeID")
+        card_cmd, self.lbl_val_cmd = self._make_field_card("CMD")
+        card_high, self.lbl_val_high = self._make_field_card("4 Byte High")
+        card_low, self.lbl_val_low = self._make_field_card("4 Byte Low")
+        card_cs, self.lbl_val_checksum = self._make_field_card("Checksum")
+
+        grid.addWidget(card_node, 0, 0)
+        grid.addWidget(card_cmd, 0, 1)
+        grid.addWidget(card_high, 1, 0, 1, 2)   # chiếm cả 2 cột
+        grid.addWidget(card_low, 2, 0, 1, 2)
+        grid.addWidget(card_cs, 3, 0, 1, 2)
+        outer_layout.addLayout(grid)
+
+        # --- Log lịch sử (chữ màu theo trạng thái, nền tối dễ đọc hex) ---
+        lbl_log_title = QLabel("Frame Log")
+        lbl_log_title.setStyleSheet("color: #5D6D7E; font-size: 11px; font-weight: 600; letter-spacing: 1px;")
+        outer_layout.addWidget(lbl_log_title)
+
+        self.txt_usb_log = QTextEdit()
+        self.txt_usb_log.setReadOnly(True)
+        self.txt_usb_log.setFont(QFont("Consolas", 9))
+        self.txt_usb_log.setStyleSheet("""
+            QTextEdit {
+                background-color: #1E2227;
+                color: #D5DBDD;
+                border-radius: 8px;
+                padding: 6px;
+                border: none;
+            }
+        """)
+        outer_layout.addWidget(self.txt_usb_log, 1)
+
+        btn_clear_usb = QPushButton("Clear Log")
+        btn_clear_usb.clicked.connect(self._clear_usb_view)
+        outer_layout.addWidget(btn_clear_usb)
+
+        return box
+
+    def _set_usb_banner(self, state: str, text: str, timestamp: str):
+        """state: 'neutral' | 'ok' | 'error' — đổi màu nền/chữ banner trạng thái."""
+        palette = {
+            "neutral": ("#EEF1F2", "#5D6D7E"),
+            "ok":      ("#E9F7EF", "#1E8449"),
+            "error":   ("#FDEDEC", "#C0392B"),
+        }
+        bg, fg = palette.get(state, palette["neutral"])
+        self.frame_usb_status.setStyleSheet(f"""
+            QFrame#statusBanner {{
+                background-color: {bg};
+                border-radius: 10px;
+            }}
+        """)
+        self.lbl_usb_status.setStyleSheet(f"font-size: 14px; font-weight: 700; color: {fg}; border: none;")
+        self.lbl_usb_status.setText(text)
+        self.lbl_usb_timestamp.setText(timestamp)
+
+    def _clear_usb_view(self):
+        self.txt_usb_log.clear()
+        self._usb_buffer = bytearray()
+        for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
+                    self.lbl_val_low, self.lbl_val_checksum):
+            lbl.setText("--")
+            lbl.setStyleSheet("color: #2C3E50; font-size: 17px; font-weight: 700; border: none;")
+        self._set_usb_banner("neutral", "Chưa nhận frame nào", "")
+
     # ------------------------------------------------------------------ #
     # Logic: cổng COM
     # ------------------------------------------------------------------ #
@@ -405,6 +572,7 @@ class SerialTerminal(QMainWindow):
     def _on_new(self):
         self.txt_receive.clear()
         self.txt_send.clear()
+        self._clear_usb_view()
         self._refresh_ports()
 
     def _on_connect(self):
@@ -511,6 +679,115 @@ class SerialTerminal(QMainWindow):
                     f.write(data)
             except Exception:
                 pass
+
+        # Song song: gom byte vào bộ đệm và tách frame USB (chạy ngầm,
+        # không phụ thuộc đang ở view nào, nên chuyển view không mất dữ liệu)
+        self._process_usb_frames(data)
+
+    # ------------------------------------------------------------------ #
+    # Giải mã frame USB: [SOF][NodeId][CMD][8 Bytes Data][Checksum] = 12 byte
+    # SOF = 0xA5 -> frame dữ liệu chuẩn | SOF = 0xEE -> frame báo lỗi
+    # ------------------------------------------------------------------ #
+    def _process_usb_frames(self, data: bytes):
+        self._usb_buffer.extend(data)
+
+        while True:
+            # Tìm vị trí byte SOF hợp lệ gần nhất (0xA5 hoặc 0xEE) trong buffer
+            idx = None
+            for i, b in enumerate(self._usb_buffer):
+                if b in (self.USB_SOF_DATA, self.USB_SOF_ERROR):
+                    idx = i
+                    break
+
+            if idx is None:
+                # Không có SOF nào trong buffer -> toàn rác, xóa để buffer không phình to
+                self._usb_buffer.clear()
+                return
+
+            if idx > 0:
+                # Bỏ các byte rác đứng trước SOF
+                del self._usb_buffer[:idx]
+
+            if len(self._usb_buffer) < self.USB_FRAME_LEN:
+                return  # Chưa đủ 12 byte, chờ thêm dữ liệu ở lần nhận sau
+
+            frame = bytes(self._usb_buffer[:self.USB_FRAME_LEN])
+            del self._usb_buffer[:self.USB_FRAME_LEN]
+            self._decode_usb_frame(frame)
+            # Lặp lại: có thể còn frame khác đã nằm sẵn trong buffer
+
+    def _decode_usb_frame(self, frame: bytes):
+        sof = frame[0]
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        hex_str = frame.hex(" ").upper()
+
+        if sof == self.USB_SOF_ERROR:
+            for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
+                        self.lbl_val_low, self.lbl_val_checksum):
+                lbl.setText("--")
+            self._set_usb_banner("error", "⚠ Error Frame nhận được", timestamp)
+            self.txt_usb_log.append(
+                f'<span style="color:#E74C3C;">[{timestamp}] LỖI</span> '
+                f'<span style="color:#D5DBDD;">| {hex_str}</span>'
+            )
+            return
+
+        # sof == USB_SOF_DATA (0xA5): frame dữ liệu chuẩn
+        node_id = frame[1]
+        cmd = frame[2]
+        data8 = frame[3:11]
+        high4 = data8[0:4]
+        low4 = data8[4:8]
+        checksum_recv = frame[11]
+        # Checksum = tổng cộng dồn (sum) 11 byte đầu (SOF..byte data cuối), lấy 8 bit thấp.
+        # (Trước đây dùng CRC8, đã comment lại ở hàm _crc8() bên dưới để dành dùng sau nếu cần.)
+        checksum_calc = self._checksum_sum8(frame[0:11])
+        is_ok = (checksum_calc == checksum_recv)
+
+        self.lbl_val_nodeid.setText(f"0x{node_id:02X}")
+        self.lbl_val_cmd.setText(f"0x{cmd:02X}")
+        self.lbl_val_high.setText(high4.hex(" ").upper())
+        self.lbl_val_low.setText(low4.hex(" ").upper())
+
+        if is_ok:
+            self.lbl_val_checksum.setText(f"0x{checksum_recv:02X}  ✓ OK")
+            self.lbl_val_checksum.setStyleSheet(
+                "color: #1E8449; font-size: 17px; font-weight: 700; border: none;")
+            self._set_usb_banner("ok", "✓ Frame hợp lệ", timestamp)
+            status_color = "#27AE60"
+            status_str = "OK"
+        else:
+            self.lbl_val_checksum.setText(
+                f"0x{checksum_recv:02X}  ✗ (tính được 0x{checksum_calc:02X})")
+            self.lbl_val_checksum.setStyleSheet(
+                "color: #C0392B; font-size: 17px; font-weight: 700; border: none;")
+            self._set_usb_banner("error", "✗ Frame SAI checksum", timestamp)
+            status_color = "#E74C3C"
+            status_str = "SAI CHECKSUM"
+
+        self.txt_usb_log.append(
+            f'<span style="color:{status_color}; font-weight:bold;">[{timestamp}] {status_str}</span> '
+            f'<span style="color:#D5DBDD;">| {hex_str} | NodeID=0x{node_id:02X} '
+            f'CMD=0x{cmd:02X} High={high4.hex(" ").upper()} Low={low4.hex(" ").upper()}</span>'
+        )
+
+    @staticmethod
+    def _checksum_sum8(data: bytes) -> int:
+        """Checksum đơn giản: cộng dồn các byte lại rồi lấy 8 bit thấp (sum & 0xFF)."""
+        return sum(data) & 0xFF
+
+    # --- CRC8 (đã tắt, không dùng nữa vì protocol thực tế dùng checksum cộng dồn) ---
+    # @staticmethod
+    # def _crc8(data: bytes, poly=0x07, init=0x00) -> int:
+    #     crc = init
+    #     for b in data:
+    #         crc ^= b
+    #         for _ in range(8):
+    #             if crc & 0x80:
+    #                 crc = ((crc << 1) ^ poly) & 0xFF
+    #             else:
+    #                 crc = (crc << 1) & 0xFF
+    #     return crc
 
     # ------------------------------------------------------------------ #
     # Gửi dữ liệu
@@ -627,3 +904,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# standard data frame
+# [SOF]     [NodeId]    [CMD]   [TypeCmd]   [8 Bytes Data]  [Checksum]
+# [0xA5]    [0x01]      [0x23]  [0x01]      [8 Bytes Data]  [Checksum]
+# [1Byte]   [1Byte]     [1Byte]             [8Bytes]        [2Byte]     = 13 bytes total
+
+# dynamic data frame
+# [SOF]     [NodeId_1]  [CMD]   [8 Bytes Data]  +    [NodeId_2]  [CMD]   [8 Bytes Data]  [Checksum]
+# [0xA5]    [0x01]      [0x23]  [8 Bytes Data]  +    [0x02]      [0x23]  [8 Bytes Data]  [Checksum]
+# [1Byte]   [1Byte]     [1Byte] [8Bytes]        +    [1Byte]     [1Byte] [8Bytes]        [2Byte]
+# 22 bytes total = 1 byte SOF + 2*(1+1+1+8) + 2 byte checksum
+# number CAN frames in dynamic data frame = (total bytes - 1 byte SOF - 2 byte checksum) / 13 bytes
