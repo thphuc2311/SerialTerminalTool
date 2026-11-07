@@ -16,7 +16,7 @@ import binascii
 from datetime import datetime
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont, QIcon, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox, QPushButton,
     QCheckBox, QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
@@ -75,6 +75,10 @@ class SerialTerminal(QMainWindow):
     USB_SOF_DATA = 0xA5    # SOF của frame dữ liệu chuẩn
     USB_SOF_ERROR = 0xEE   # SOF của frame báo lỗi
 
+    # Giới hạn hiển thị để tránh văn bản phình to vô hạn gây lag khi chạy lâu
+    MAX_RECV_CHARS = 128 * 1024   # khớp với nhãn "Byte<128KB" trên giao diện
+    MAX_USB_LOG_BLOCKS = 1000     # số dòng tối đa giữ lại trong Frame Log
+
     def __init__(self):
         super().__init__()
         self.ser = None
@@ -86,12 +90,27 @@ class SerialTerminal(QMainWindow):
         self.last_recv_count = 0
         self._usb_buffer = bytearray()  # buffer gom byte để tách frame USB
 
+        # Hàng chờ phục vụ batching: dữ liệu được xếp vào đây ngay khi nhận,
+        # còn việc vẽ lên GUI do timer _flush_receive_display() đảm nhiệm
+        # theo chu kỳ cố định, thay vì vẽ ngay mỗi lần nhận (gây lag khi dồn dập).
+        self._pending_raw_text = []
+        self._pending_usb_log_lines = []
+        self._pending_autoscroll = False
+        self._recv_count_dirty = False
+        self._recv_char_count = 0  # theo dõi độ dài hiện tại của txt_receive
+
         self.setWindowTitle("Serial Terminal")
         self.resize(900, 620)
 
         self._build_toolbar()
         self._build_body()
         self._refresh_ports()
+
+        # Timer gom (batch) nhiều lần nhận dữ liệu lại, chỉ vẽ GUI 1 lần mỗi
+        # chu kỳ 50ms -> giảm hẳn số lần redraw khi dữ liệu đến dồn dập.
+        self.ui_flush_timer = QTimer(self)
+        self.ui_flush_timer.timeout.connect(self._flush_receive_display)
+        self.ui_flush_timer.start(50)
 
         # Đồng bộ view mặc định = Serial, sau khi stack widget đã được tạo
         self.act_view_serial.toggled.connect(
@@ -548,10 +567,14 @@ class SerialTerminal(QMainWindow):
 
     def _clear_all_logs(self):
         """Xoá log ở cả 2 view: text nhận của Serial view và frame log của USB view."""
+        self._pending_raw_text.clear()
+        self._pending_autoscroll = False
+        self._recv_char_count = 0
         self.txt_receive.clear()
         self._clear_usb_view()
 
     def _clear_usb_view(self):
+        self._pending_usb_log_lines.clear()
         self.txt_usb_log.clear()
         self._usb_buffer = bytearray()
         for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
@@ -654,8 +677,13 @@ class SerialTerminal(QMainWindow):
     # Nhận dữ liệu
     # ------------------------------------------------------------------ #
     def _on_data_received(self, data: bytes):
+        """Chạy mỗi khi có dữ liệu mới. CHỈ xử lý dữ liệu (rẻ) và xếp vào hàng
+        chờ hiển thị — KHÔNG đụng vào GUI trực tiếp ở đây, để tránh việc vẽ lại
+        QTextEdit hàng trăm/ngàn lần mỗi giây khi dữ liệu đến dồn dập (nguyên
+        nhân chính gây lag). Việc vẽ GUI thật sự do self._flush_receive_display()
+        đảm nhiệm, chạy theo timer (gom nhiều lần nhận lại, vẽ 1 lần)."""
         self.recv_count += len(data)
-        self.lbl_recv_count.setText(str(self.recv_count))
+        self._recv_count_dirty = True
 
         if self.chk_hexshow.isChecked():
             text = binascii.hexlify(data, " ").decode().upper() + " "
@@ -666,16 +694,11 @@ class SerialTerminal(QMainWindow):
             text = f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] " + text
 
         if self.chk_hidetext.isChecked():
-            self.txt_receive.append("*" * max(len(text), 1))
-        else:
-            cursor = self.txt_receive.textCursor()
-            cursor.movePosition(cursor.End)
-            self.txt_receive.setTextCursor(cursor)
-            self.txt_receive.insertPlainText(text)
+            text = "*" * max(len(text), 1)
 
+        self._pending_raw_text.append(text)
         if self.chk_autoscroll.isChecked():
-            sb = self.txt_receive.verticalScrollBar()
-            sb.setValue(sb.maximum())
+            self._pending_autoscroll = True
 
         if self.chk_savefile.isChecked() and self._save_file_path:
             try:
@@ -684,9 +707,68 @@ class SerialTerminal(QMainWindow):
             except Exception:
                 pass
 
-        # Song song: gom byte vào bộ đệm và tách frame USB (chạy ngầm,
-        # không phụ thuộc đang ở view nào, nên chuyển view không mất dữ liệu)
+        # Tách frame USB vẫn chạy ngay (xử lý thuần Python, không đụng GUI nên
+        # rẻ), không phụ thuộc đang ở view nào -> chuyển view không mất dữ liệu.
         self._process_usb_frames(data)
+
+    def _flush_receive_display(self):
+        """Được gọi định kỳ bởi self.ui_flush_timer (mặc định mỗi 50ms).
+        Gom tất cả phần chờ (raw text + usb log) lại và vẽ GUI đúng 1 lần,
+        thay vì vẽ lại mỗi khi có 1 gói dữ liệu nhỏ đến -> giảm lag rõ rệt
+        khi luồng dữ liệu đến dồn dập (baud cao, đọc từng mẩu nhỏ)."""
+        if self._pending_raw_text:
+            combined = "".join(self._pending_raw_text)
+            self._pending_raw_text.clear()
+
+            self.txt_receive.setUpdatesEnabled(False)
+            cursor = self.txt_receive.textCursor()
+            cursor.movePosition(cursor.End)
+            self.txt_receive.setTextCursor(cursor)
+            self.txt_receive.insertPlainText(combined)
+            self._recv_char_count += len(combined)
+            self._trim_text_edit_if_needed(self.txt_receive)
+            self.txt_receive.setUpdatesEnabled(True)
+
+            if self._pending_autoscroll:
+                sb = self.txt_receive.verticalScrollBar()
+                sb.setValue(sb.maximum())
+                self._pending_autoscroll = False
+
+        if self._pending_usb_log_lines:
+            combined_html = "<br>".join(self._pending_usb_log_lines)
+            self._pending_usb_log_lines.clear()
+
+            self.txt_usb_log.setUpdatesEnabled(False)
+            self.txt_usb_log.append(combined_html)
+            self._trim_usb_log_if_needed()
+            self.txt_usb_log.setUpdatesEnabled(True)
+            sb2 = self.txt_usb_log.verticalScrollBar()
+            sb2.setValue(sb2.maximum())
+
+        if self._recv_count_dirty:
+            self.lbl_recv_count.setText(str(self.recv_count))
+            self._recv_count_dirty = False
+
+    def _trim_text_edit_if_needed(self, text_edit):
+        """Giữ nội dung ô text không vượt quá MAX_RECV_CHARS (giống đúng cái
+        nhãn 'Byte<128KB' đã ghi sẵn trên giao diện) — xóa bớt phần cũ nhất
+        khi vượt, để văn bản không phình to vô hạn làm app càng chạy càng ì."""
+        overflow = self._recv_char_count - self.MAX_RECV_CHARS
+        if overflow > 0:
+            cursor = text_edit.textCursor()
+            cursor.movePosition(cursor.Start)
+            cursor.movePosition(cursor.Right, cursor.KeepAnchor, overflow)
+            cursor.removeSelectedText()
+            self._recv_char_count -= overflow
+
+    def _trim_usb_log_if_needed(self):
+        """Giới hạn số dòng trong Frame Log, xóa dòng cũ nhất khi vượt quá."""
+        doc = self.txt_usb_log.document()
+        while doc.blockCount() > self.MAX_USB_LOG_BLOCKS:
+            cursor = QTextCursor(doc.findBlockByNumber(0))
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # xóa luôn ký tự xuống dòng còn sót lại
 
     # ------------------------------------------------------------------ #
     # Giải mã frame USB: [SOF][NodeId][CMD][8 Bytes Data][Checksum] = 12 byte
@@ -730,7 +812,7 @@ class SerialTerminal(QMainWindow):
                         self.lbl_val_low, self.lbl_val_checksum):
                 lbl.setText("--")
             self._set_usb_banner("error", "⚠ Error Frame nhận được", timestamp)
-            self.txt_usb_log.append(
+            self._pending_usb_log_lines.append(
                 f'<span style="color:#E74C3C;">[{timestamp}] LỖI</span> '
                 f'<span style="color:#D5DBDD;">| {hex_str}</span>'
             )
@@ -769,7 +851,7 @@ class SerialTerminal(QMainWindow):
             status_color = "#E74C3C"
             status_str = "SAI CHECKSUM"
 
-        self.txt_usb_log.append(
+        self._pending_usb_log_lines.append(
             f'<span style="color:{status_color}; font-weight:bold;">[{timestamp}] {status_str}</span> '
             f'<span style="color:#D5DBDD;">| {hex_str} | NodeID=0x{node_id:02X} '
             f'CMD=0x{cmd:02X} High={high4.hex(" ").upper()} Low={low4.hex(" ").upper()}</span>'
