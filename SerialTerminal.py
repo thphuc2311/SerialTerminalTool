@@ -324,7 +324,7 @@ class SerialTerminal(QMainWindow):
         btn_choose_save.setMaximumWidth(30)
         btn_choose_save.clicked.connect(self._choose_save_file)
         btn_clear_recv = QPushButton("Clear")
-        btn_clear_recv.clicked.connect(self.txt_receive.clear)
+        btn_clear_recv.clicked.connect(self._clear_all_logs)
         save_row.addWidget(self.chk_savefile)
         save_row.addWidget(self.lbl_savefile, 1)
         save_row.addWidget(btn_choose_save)
@@ -523,7 +523,7 @@ class SerialTerminal(QMainWindow):
         outer_layout.addWidget(self.txt_usb_log, 1)
 
         btn_clear_usb = QPushButton("Clear Log")
-        btn_clear_usb.clicked.connect(self._clear_usb_view)
+        btn_clear_usb.clicked.connect(self._clear_all_logs)
         outer_layout.addWidget(btn_clear_usb)
 
         return box
@@ -545,6 +545,11 @@ class SerialTerminal(QMainWindow):
         self.lbl_usb_status.setStyleSheet(f"font-size: 14px; font-weight: 700; color: {fg}; border: none;")
         self.lbl_usb_status.setText(text)
         self.lbl_usb_timestamp.setText(timestamp)
+
+    def _clear_all_logs(self):
+        """Xoá log ở cả 2 view: text nhận của Serial view và frame log của USB view."""
+        self.txt_receive.clear()
+        self._clear_usb_view()
 
     def _clear_usb_view(self):
         self.txt_usb_log.clear()
@@ -570,9 +575,8 @@ class SerialTerminal(QMainWindow):
             self.cmb_port.addItem(p.device)
 
     def _on_new(self):
-        self.txt_receive.clear()
+        self._clear_all_logs()
         self.txt_send.clear()
-        self._clear_usb_view()
         self._refresh_ports()
 
     def _on_connect(self):
