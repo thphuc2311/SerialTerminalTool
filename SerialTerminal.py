@@ -11,7 +11,10 @@ Chạy:
 """
 
 import sys
+import os
 import time
+import json
+import struct
 import binascii
 from datetime import datetime
 
@@ -21,7 +24,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QComboBox, QPushButton,
     QCheckBox, QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QFileDialog, QAction, QActionGroup, QToolBar, QLineEdit, QSpinBox, QFrame,
-    QSizePolicy, QMessageBox, QSplitter, QStackedWidget
+    QSizePolicy, QMessageBox, QSplitter, QStackedWidget, QDialog, QListWidget,
+    QListWidgetItem, QDialogButtonBox
 )
 
 try:
@@ -67,6 +71,268 @@ class SerialReaderThread(QThread):
 
 
 # --------------------------------------------------------------------------- #
+# Dialog cấu hình kiểu dữ liệu High/Low theo từng CMD
+# --------------------------------------------------------------------------- #
+class CmdConfigDialog(QDialog):
+    """Quản lý danh sách CMD -> kiểu dữ liệu convert cho field '4 byte high'
+    và '4 byte low'. Mỗi CMD có 1 endian dùng chung, và high/low có thể chọn
+    kiểu khác nhau (vd: high=Int32, low=Bool lấy bit MSB của byte thứ 4)."""
+
+    FIELD_TYPES = [
+        ("Raw (không convert)", "raw"),
+        ("int32", "int32"),
+        ("uint32", "uint32"),
+        ("float32", "float32"),
+        ("int16 x2", "int16x2"),
+        ("uint16 x2", "uint16x2"),
+        ("bool (1 bit)", "bool"),
+    ]
+
+    def __init__(self, cmd_configs: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cấu hình kiểu dữ liệu theo CMD")
+        self.resize(560, 420)
+
+        # Làm việc trên bản sao, chỉ ghi ngược lại self.cmd_configs khi người
+        # dùng bấm OK -> bấm Cancel sẽ không làm mất cấu hình gốc.
+        self._configs = {k: json.loads(json.dumps(v)) for k, v in cmd_configs.items()}
+        self._current_cmd = None
+
+        outer = QVBoxLayout(self)
+        root = QHBoxLayout()
+        outer.addLayout(root, 1)
+
+        # --- Cột trái: danh sách CMD đã cấu hình ---
+        left_col = QVBoxLayout()
+        left_col.addWidget(QLabel("Danh sách CMD:"))
+        self.list_cmd = QListWidget()
+        self.list_cmd.currentItemChanged.connect(self._on_select_cmd)
+        left_col.addWidget(self.list_cmd)
+
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("Thêm CMD")
+        btn_add.clicked.connect(self._on_add_cmd)
+        btn_remove = QPushButton("Xoá")
+        btn_remove.clicked.connect(self._on_remove_cmd)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_remove)
+        left_col.addLayout(btn_row)
+
+        file_row = QHBoxLayout()
+        btn_save_file = QPushButton("Lưu Config ra file...")
+        btn_save_file.clicked.connect(self._on_save_to_file)
+        btn_load_file = QPushButton("Tải Config từ file...")
+        btn_load_file.clicked.connect(self._on_load_from_file)
+        file_row.addWidget(btn_save_file)
+        file_row.addWidget(btn_load_file)
+        left_col.addLayout(file_row)
+
+        root.addLayout(left_col, 1)
+
+        # --- Cột phải: form chỉnh kiểu dữ liệu cho CMD đang chọn ---
+        right_col = QVBoxLayout()
+
+        cmd_row = QHBoxLayout()
+        cmd_row.addWidget(QLabel("CMD (hex):"))
+        self.edt_cmd = QLineEdit()
+        self.edt_cmd.setPlaceholderText("vd: 0x23")
+        self.edt_cmd.editingFinished.connect(self._on_cmd_hex_edited)
+        cmd_row.addWidget(self.edt_cmd)
+        right_col.addLayout(cmd_row)
+
+        endian_row = QHBoxLayout()
+        endian_row.addWidget(QLabel("Thứ tự byte:"))
+        self.cmb_endian = QComboBox()
+        self.cmb_endian.addItem("Big Endian (MSB trước)", "big")
+        self.cmb_endian.addItem("Little Endian (LSB trước)", "little")
+        self.cmb_endian.currentIndexChanged.connect(self._on_field_changed)
+        endian_row.addWidget(self.cmb_endian)
+        right_col.addLayout(endian_row)
+
+        self.high_group, self.cmb_high_type, self.spin_high_byte, self.cmb_high_bit = \
+            self._build_field_group("4 Byte High")
+        right_col.addWidget(self.high_group)
+
+        self.low_group, self.cmb_low_type, self.spin_low_byte, self.cmb_low_bit = \
+            self._build_field_group("4 Byte Low")
+        right_col.addWidget(self.low_group)
+
+        right_col.addStretch()
+        root.addLayout(right_col, 2)
+
+        self._set_form_enabled(False)
+        self._refresh_list()
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        outer.addWidget(button_box)
+
+    def _build_field_group(self, title):
+        group = QGroupBox(title)
+        layout = QGridLayout(group)
+
+        layout.addWidget(QLabel("Kiểu:"), 0, 0)
+        cmb_type = QComboBox()
+        for label, key in self.FIELD_TYPES:
+            cmb_type.addItem(label, key)
+        cmb_type.currentIndexChanged.connect(self._on_field_changed)
+        layout.addWidget(cmb_type, 0, 1)
+
+        layout.addWidget(QLabel("Byte thứ (0-3):"), 1, 0)
+        spin_byte = QSpinBox()
+        spin_byte.setRange(0, 3)
+        spin_byte.setValue(3)
+        spin_byte.valueChanged.connect(self._on_field_changed)
+        layout.addWidget(spin_byte, 1, 1)
+
+        layout.addWidget(QLabel("Bit (0=LSB..7=MSB):"), 2, 0)
+        cmb_bit = QComboBox()
+        for b in range(7, -1, -1):
+            label = f"{b}" + ("  (MSB)" if b == 7 else "  (LSB)" if b == 0 else "")
+            cmb_bit.addItem(label, b)
+        cmb_bit.currentIndexChanged.connect(self._on_field_changed)
+        layout.addWidget(cmb_bit, 2, 1)
+
+        return group, cmb_type, spin_byte, cmb_bit
+
+    def _set_form_enabled(self, enabled: bool):
+        self.edt_cmd.setEnabled(enabled)
+        self.cmb_endian.setEnabled(enabled)
+        self.high_group.setEnabled(enabled)
+        self.low_group.setEnabled(enabled)
+
+    def _refresh_list(self):
+        self.list_cmd.blockSignals(True)
+        self.list_cmd.clear()
+        for cmd in sorted(self._configs.keys()):
+            item = QListWidgetItem(f"0x{cmd:02X}")
+            item.setData(Qt.UserRole, cmd)
+            self.list_cmd.addItem(item)
+        self.list_cmd.blockSignals(False)
+
+    def _on_add_cmd(self):
+        # Tìm 1 mã CMD chưa dùng để tạo entry mới
+        new_cmd = 0x00
+        while new_cmd in self._configs and new_cmd < 0xFF:
+            new_cmd += 1
+        self._configs[new_cmd] = {
+            "endian": "big",
+            "high": {"type": "raw"},
+            "low": {"type": "raw"},
+        }
+        self._refresh_list()
+        self._select_cmd_in_list(new_cmd)
+
+    def _on_remove_cmd(self):
+        if self._current_cmd is None:
+            return
+        self._configs.pop(self._current_cmd, None)
+        self._current_cmd = None
+        self._set_form_enabled(False)
+        self._refresh_list()
+
+    def _select_cmd_in_list(self, cmd):
+        for i in range(self.list_cmd.count()):
+            item = self.list_cmd.item(i)
+            if item.data(Qt.UserRole) == cmd:
+                self.list_cmd.setCurrentItem(item)
+                break
+
+    def _on_select_cmd(self, current, previous):
+        if current is None:
+            self._current_cmd = None
+            self._set_form_enabled(False)
+            return
+        cmd = current.data(Qt.UserRole)
+        self._current_cmd = cmd
+        cfg = self._configs.get(cmd, {})
+        self._loading = True
+        self.edt_cmd.setText(f"0x{cmd:02X}")
+        idx = self.cmb_endian.findData(cfg.get("endian", "big"))
+        self.cmb_endian.setCurrentIndex(max(idx, 0))
+        self._load_field_group(cfg.get("high", {}), self.cmb_high_type, self.spin_high_byte, self.cmb_high_bit)
+        self._load_field_group(cfg.get("low", {}), self.cmb_low_type, self.spin_low_byte, self.cmb_low_bit)
+        self._loading = False
+        self._set_form_enabled(True)
+
+    def _load_field_group(self, field_cfg, cmb_type, spin_byte, cmb_bit):
+        idx = cmb_type.findData(field_cfg.get("type", "raw"))
+        cmb_type.setCurrentIndex(max(idx, 0))
+        spin_byte.setValue(field_cfg.get("byte_index", 3))
+        bit_idx = cmb_bit.findData(field_cfg.get("bit_index", 7))
+        cmb_bit.setCurrentIndex(max(bit_idx, 0))
+
+    def _on_cmd_hex_edited(self):
+        if self._current_cmd is None:
+            return
+        text = self.edt_cmd.text().strip()
+        try:
+            new_cmd = int(text, 16)
+            if not (0 <= new_cmd <= 0xFF):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Giá trị không hợp lệ", "CMD phải là giá trị hex từ 0x00 đến 0xFF.")
+            self.edt_cmd.setText(f"0x{self._current_cmd:02X}")
+            return
+        if new_cmd != self._current_cmd:
+            if new_cmd in self._configs:
+                QMessageBox.warning(self, "Trùng CMD", f"CMD 0x{new_cmd:02X} đã tồn tại trong danh sách.")
+                self.edt_cmd.setText(f"0x{self._current_cmd:02X}")
+                return
+            self._configs[new_cmd] = self._configs.pop(self._current_cmd)
+            self._current_cmd = new_cmd
+            self._refresh_list()
+            self._select_cmd_in_list(new_cmd)
+
+    def _on_field_changed(self, *args):
+        if getattr(self, "_loading", False) or self._current_cmd is None:
+            return
+        cfg = self._configs.setdefault(self._current_cmd, {})
+        cfg["endian"] = self.cmb_endian.currentData()
+        cfg["high"] = {
+            "type": self.cmb_high_type.currentData(),
+            "byte_index": self.spin_high_byte.value(),
+            "bit_index": self.cmb_high_bit.currentData(),
+        }
+        cfg["low"] = {
+            "type": self.cmb_low_type.currentData(),
+            "byte_index": self.spin_low_byte.value(),
+            "bit_index": self.cmb_low_bit.currentData(),
+        }
+
+    def _on_save_to_file(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Lưu Config", "usb_cmd_config.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = {f"0x{cmd:02X}": cfg for cmd, cfg in self._configs.items()}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Thành công", f"Đã lưu config ra:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi lưu file", str(e))
+
+    def _on_load_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Tải Config", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._configs = {int(k, 16): v for k, v in data.items()}
+            self._current_cmd = None
+            self._set_form_enabled(False)
+            self._refresh_list()
+            QMessageBox.information(self, "Thành công", f"Đã tải config từ:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi tải file", str(e))
+
+    def get_configs(self):
+        return self._configs
+
+
+# --------------------------------------------------------------------------- #
 # Cửa sổ chính
 # --------------------------------------------------------------------------- #
 class SerialTerminal(QMainWindow):
@@ -98,6 +364,14 @@ class SerialTerminal(QMainWindow):
         self._pending_autoscroll = False
         self._recv_count_dirty = False
         self._recv_char_count = 0  # theo dõi độ dài hiện tại của txt_receive
+
+        # Cấu hình kiểu dữ liệu convert High/Low theo từng CMD, vd:
+        # {0x23: {"endian": "big", "high": {"type": "int32"},
+        #         "low": {"type": "bool", "byte_index": 3, "bit_index": 7}}}
+        # Tự động lưu/tải ở file JSON cạnh script, nên khởi động lại app vẫn giữ.
+        self._cmd_config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "usb_cmd_config.json")
+        self.cmd_configs = self._load_cmd_configs()
 
         self.setWindowTitle("Serial Terminal")
         self.resize(900, 620)
@@ -166,6 +440,12 @@ class SerialTerminal(QMainWindow):
 
         toolbar.addAction(self.act_view_serial)
         toolbar.addAction(self.act_view_usb)
+
+        toolbar.addSeparator()
+
+        act_cmd_config = QAction("CMD Config", self)
+        act_cmd_config.triggered.connect(self._open_cmd_config_dialog)
+        toolbar.addAction(act_cmd_config)
 
         toolbar.addSeparator()
 
@@ -485,6 +765,45 @@ class SerialTerminal(QMainWindow):
 
         return card, lbl_value
 
+    def _make_convertible_field_card(self, title: str):
+        """Giống _make_field_card nhưng có thêm 1 dòng hiển thị giá trị đã
+        convert (int32/float32/bool...) bên dưới dòng raw hex. Trả về
+        (card, lbl_raw, lbl_conv)."""
+        card = QFrame()
+        card.setObjectName("fieldCard")
+        card.setStyleSheet("""
+            QFrame#fieldCard {
+                background-color: #F5F7F8;
+                border: 1px solid #DDE3E6;
+                border-radius: 10px;
+            }
+        """)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 8, 12, 10)
+        card_layout.setSpacing(2)
+
+        lbl_title = QLabel(title.upper())
+        lbl_title.setStyleSheet("""
+            color: #8A97A0; font-size: 11px; font-weight: 600;
+            letter-spacing: 1px; border: none;
+        """)
+        card_layout.addWidget(lbl_title)
+
+        # Dòng 1: giá trị raw (hex) — luôn hiển thị
+        lbl_raw = QLabel("--")
+        lbl_raw.setStyleSheet("color: #2C3E50; font-size: 15px; font-weight: 700; border: none;")
+        lbl_raw.setFont(QFont("Consolas", 11, QFont.Bold))
+        card_layout.addWidget(lbl_raw)
+
+        # Dòng 2: giá trị đã convert theo cấu hình CMD — chỉ hiện khi có config
+        lbl_conv = QLabel("")
+        lbl_conv.setStyleSheet("color: #2E86C1; font-size: 13px; font-weight: 600; border: none;")
+        lbl_conv.setFont(QFont("Consolas", 10))
+        lbl_conv.setVisible(False)
+        card_layout.addWidget(lbl_conv)
+
+        return card, lbl_raw, lbl_conv
+
     def _build_usb_view(self):
         box = QGroupBox("USB View — Decoded Frame")
         outer_layout = QVBoxLayout(box)
@@ -511,8 +830,8 @@ class SerialTerminal(QMainWindow):
 
         card_node, self.lbl_val_nodeid = self._make_field_card("NodeID")
         card_cmd, self.lbl_val_cmd = self._make_field_card("CMD")
-        card_high, self.lbl_val_high = self._make_field_card("4 Byte High")
-        card_low, self.lbl_val_low = self._make_field_card("4 Byte Low")
+        card_high, self.lbl_val_high, self.lbl_conv_high = self._make_convertible_field_card("4 Byte High")
+        card_low, self.lbl_val_low, self.lbl_conv_low = self._make_convertible_field_card("4 Byte Low")
         card_cs, self.lbl_val_checksum = self._make_field_card("Checksum")
 
         grid.addWidget(card_node, 0, 0)
@@ -577,10 +896,15 @@ class SerialTerminal(QMainWindow):
         self._pending_usb_log_lines.clear()
         self.txt_usb_log.clear()
         self._usb_buffer = bytearray()
-        for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
-                    self.lbl_val_low, self.lbl_val_checksum):
+        for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_checksum):
             lbl.setText("--")
             lbl.setStyleSheet("color: #2C3E50; font-size: 17px; font-weight: 700; border: none;")
+        for lbl in (self.lbl_val_high, self.lbl_val_low):
+            lbl.setText("--")
+            lbl.setStyleSheet("color: #2C3E50; font-size: 15px; font-weight: 700; border: none;")
+        for lbl in (self.lbl_conv_high, self.lbl_conv_low):
+            lbl.setText("")
+            lbl.setVisible(False)
         self._set_usb_banner("neutral", "Chưa nhận frame nào", "")
 
     # ------------------------------------------------------------------ #
@@ -811,6 +1135,9 @@ class SerialTerminal(QMainWindow):
             for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
                         self.lbl_val_low, self.lbl_val_checksum):
                 lbl.setText("--")
+            for lbl in (self.lbl_conv_high, self.lbl_conv_low):
+                lbl.setText("")
+                lbl.setVisible(False)
             self._set_usb_banner("error", "⚠ Error Frame nhận được", timestamp)
             self._pending_usb_log_lines.append(
                 f'<span style="color:#E74C3C;">[{timestamp}] LỖI</span> '
@@ -835,6 +1162,28 @@ class SerialTerminal(QMainWindow):
         self.lbl_val_high.setText(high4.hex(" ").upper())
         self.lbl_val_low.setText(low4.hex(" ").upper())
 
+        # Nếu CMD này có cấu hình kiểu dữ liệu -> hiển thị thêm giá trị đã convert
+        field_cfg = self.cmd_configs.get(cmd)
+        conv_high_str = conv_low_str = None
+        if field_cfg:
+            endian = field_cfg.get("endian", "big")
+            conv_high_str = self._convert_field(high4, field_cfg.get("high", {}), endian)
+            conv_low_str = self._convert_field(low4, field_cfg.get("low", {}), endian)
+
+        if conv_high_str:
+            self.lbl_conv_high.setText(f"→ {conv_high_str}")
+            self.lbl_conv_high.setVisible(True)
+        else:
+            self.lbl_conv_high.setText("")
+            self.lbl_conv_high.setVisible(False)
+
+        if conv_low_str:
+            self.lbl_conv_low.setText(f"→ {conv_low_str}")
+            self.lbl_conv_low.setVisible(True)
+        else:
+            self.lbl_conv_low.setText("")
+            self.lbl_conv_low.setVisible(False)
+
         if is_ok:
             self.lbl_val_checksum.setText(f"0x{checksum_recv:02X}  ✓ OK")
             self.lbl_val_checksum.setStyleSheet(
@@ -851,11 +1200,79 @@ class SerialTerminal(QMainWindow):
             status_color = "#E74C3C"
             status_str = "SAI CHECKSUM"
 
+        conv_suffix = ""
+        if conv_high_str or conv_low_str:
+            conv_suffix = (f' <span style="color:#5DADE2;">[{conv_high_str or ""}'
+                            f'{" | " if conv_high_str and conv_low_str else ""}'
+                            f'{conv_low_str or ""}]</span>')
         self._pending_usb_log_lines.append(
             f'<span style="color:{status_color}; font-weight:bold;">[{timestamp}] {status_str}</span> '
             f'<span style="color:#D5DBDD;">| {hex_str} | NodeID=0x{node_id:02X} '
             f'CMD=0x{cmd:02X} High={high4.hex(" ").upper()} Low={low4.hex(" ").upper()}</span>'
+            f'{conv_suffix}'
         )
+
+    @staticmethod
+    def _convert_field(raw4: bytes, field_cfg: dict, endian: str):
+        """Convert 4 byte raw sang kiểu dữ liệu theo field_cfg (xem CmdConfigDialog).
+        Trả về chuỗi hiển thị, hoặc None nếu type='raw' (không cần hiển thị thêm)."""
+        ftype = field_cfg.get("type", "raw")
+        if not ftype or ftype == "raw":
+            return None
+
+        prefix = ">" if endian == "big" else "<"
+        try:
+            if ftype == "int32":
+                val = struct.unpack(prefix + "i", raw4)[0]
+                return f"int32: {val}"
+            if ftype == "uint32":
+                val = struct.unpack(prefix + "I", raw4)[0]
+                return f"uint32: {val}"
+            if ftype == "float32":
+                val = struct.unpack(prefix + "f", raw4)[0]
+                return f"float32: {val:.6g}"
+            if ftype == "int16x2":
+                v1, v2 = struct.unpack(prefix + "2h", raw4)
+                return f"int16[2]: {v1}, {v2}"
+            if ftype == "uint16x2":
+                v1, v2 = struct.unpack(prefix + "2H", raw4)
+                return f"uint16[2]: {v1}, {v2}"
+            if ftype == "bool":
+                byte_idx = max(0, min(3, field_cfg.get("byte_index", 3)))
+                bit_idx = max(0, min(7, field_cfg.get("bit_index", 7)))
+                bit_val = bool((raw4[byte_idx] >> bit_idx) & 0x01)
+                return f"bool (byte{byte_idx}.bit{bit_idx}): {bit_val}"
+        except Exception as e:
+            return f"lỗi convert ({e})"
+        return None
+
+    def _open_cmd_config_dialog(self):
+        dlg = CmdConfigDialog(self.cmd_configs, self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.cmd_configs = dlg.get_configs()
+            self._save_cmd_configs()
+
+    def _load_cmd_configs(self) -> dict:
+        """Tự động tải cấu hình CMD từ file JSON cạnh script (nếu có)."""
+        if not os.path.isfile(self._cmd_config_path):
+            return {}
+        try:
+            with open(self._cmd_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {int(k, 16): v for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _save_cmd_configs(self):
+        """Tự động lưu cấu hình CMD ra file JSON cạnh script (chạy khi bấm OK
+        trong dialog CMD Config), để lần sau mở app vẫn còn nguyên cấu hình."""
+        try:
+            data = {f"0x{cmd:02X}": cfg for cmd, cfg in self.cmd_configs.items()}
+            with open(self._cmd_config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            QMessageBox.warning(self, "Không lưu được config",
+                                 f"Không thể lưu config mặc định:\n{e}")
 
     @staticmethod
     def _checksum_sum8(data: bytes) -> int:
