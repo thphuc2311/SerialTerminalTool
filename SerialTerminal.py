@@ -80,12 +80,12 @@ class CmdConfigDialog(QDialog):
 
     FIELD_TYPES = [
         ("Raw (không convert)", "raw"),
-        ("int32", "int32"),
-        ("uint32", "uint32"),
-        ("float32", "float32"),
-        ("int16 x2", "int16x2"),
-        ("uint16 x2", "uint16x2"),
-        ("bool (1 bit)", "bool"),
+        ("Int32", "int32"),
+        ("UInt32", "uint32"),
+        ("Float32", "float32"),
+        ("Int16 x2", "int16x2"),
+        ("UInt16 x2", "uint16x2"),
+        ("Bool (1 bit)", "bool"),
     ]
 
     def __init__(self, cmd_configs: dict, parent=None):
@@ -727,17 +727,18 @@ class SerialTerminal(QMainWindow):
         return panel
 
     # ---- USB View: panel hiển thị frame đã giải mã (dạng card) ---- #
-    def _make_field_card(self, title: str, span_full: bool = False):
+    def _make_field_card(self, title: str, value_color: str = "#2C3E50", border_color: str = "#DDE3E6"):
         """Tạo 1 ô 'card' bo góc gồm nhãn nhỏ phía trên + giá trị lớn phía dưới.
-        Trả về (frame_widget, value_label) để nơi gọi giữ tham chiếu value_label."""
+        value_color/border_color cho phép đổi màu để phân biệt card Raw và
+        card Converted. Trả về (frame_widget, value_label)."""
         card = QFrame()
         card.setObjectName("fieldCard")
-        card.setStyleSheet("""
-            QFrame#fieldCard {
+        card.setStyleSheet(f"""
+            QFrame#fieldCard {{
                 background-color: #F5F7F8;
-                border: 1px solid #DDE3E6;
+                border: 1px solid {border_color};
                 border-radius: 10px;
-            }
+            }}
         """)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(12, 8, 12, 10)
@@ -754,55 +755,17 @@ class SerialTerminal(QMainWindow):
         card_layout.addWidget(lbl_title)
 
         lbl_value = QLabel("--")
-        lbl_value.setStyleSheet("""
-            color: #2C3E50;
-            font-size: 17px;
+        lbl_value.setStyleSheet(f"""
+            color: {value_color};
+            font-size: 15px;
             font-weight: 700;
             border: none;
         """)
-        lbl_value.setFont(QFont("Consolas", 12, QFont.Bold))
+        lbl_value.setFont(QFont("Consolas", 11, QFont.Bold))
+        lbl_value.setWordWrap(True)
         card_layout.addWidget(lbl_value)
 
         return card, lbl_value
-
-    def _make_convertible_field_card(self, title: str):
-        """Giống _make_field_card nhưng có thêm 1 dòng hiển thị giá trị đã
-        convert (int32/float32/bool...) bên dưới dòng raw hex. Trả về
-        (card, lbl_raw, lbl_conv)."""
-        card = QFrame()
-        card.setObjectName("fieldCard")
-        card.setStyleSheet("""
-            QFrame#fieldCard {
-                background-color: #F5F7F8;
-                border: 1px solid #DDE3E6;
-                border-radius: 10px;
-            }
-        """)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(12, 8, 12, 10)
-        card_layout.setSpacing(2)
-
-        lbl_title = QLabel(title.upper())
-        lbl_title.setStyleSheet("""
-            color: #8A97A0; font-size: 11px; font-weight: 600;
-            letter-spacing: 1px; border: none;
-        """)
-        card_layout.addWidget(lbl_title)
-
-        # Dòng 1: giá trị raw (hex) — luôn hiển thị
-        lbl_raw = QLabel("--")
-        lbl_raw.setStyleSheet("color: #2C3E50; font-size: 15px; font-weight: 700; border: none;")
-        lbl_raw.setFont(QFont("Consolas", 11, QFont.Bold))
-        card_layout.addWidget(lbl_raw)
-
-        # Dòng 2: giá trị đã convert theo cấu hình CMD — chỉ hiện khi có config
-        lbl_conv = QLabel("")
-        lbl_conv.setStyleSheet("color: #2E86C1; font-size: 13px; font-weight: 600; border: none;")
-        lbl_conv.setFont(QFont("Consolas", 10))
-        lbl_conv.setVisible(False)
-        card_layout.addWidget(lbl_conv)
-
-        return card, lbl_raw, lbl_conv
 
     def _build_usb_view(self):
         box = QGroupBox("USB View — Decoded Frame")
@@ -830,15 +793,24 @@ class SerialTerminal(QMainWindow):
 
         card_node, self.lbl_val_nodeid = self._make_field_card("NodeID")
         card_cmd, self.lbl_val_cmd = self._make_field_card("CMD")
-        card_high, self.lbl_val_high, self.lbl_conv_high = self._make_convertible_field_card("4 Byte High")
-        card_low, self.lbl_val_low, self.lbl_conv_low = self._make_convertible_field_card("4 Byte Low")
+        # Card "Convert" dùng màu xanh để phân biệt trực quan với card Raw
+        card_high_raw, self.lbl_val_high = self._make_field_card("4 Byte High (Raw)")
+        card_high_conv, self.lbl_conv_high = self._make_field_card(
+            "High → Convert", value_color="#2E86C1", border_color="#BFDCF0")
+        card_low_raw, self.lbl_val_low = self._make_field_card("4 Byte Low (Raw)")
+        card_low_conv, self.lbl_conv_low = self._make_field_card(
+            "Low → Convert", value_color="#2E86C1", border_color="#BFDCF0")
         card_cs, self.lbl_val_checksum = self._make_field_card("Checksum")
 
         grid.addWidget(card_node, 0, 0)
         grid.addWidget(card_cmd, 0, 1)
-        grid.addWidget(card_high, 1, 0, 1, 2)   # chiếm cả 2 cột
-        grid.addWidget(card_low, 2, 0, 1, 2)
+        grid.addWidget(card_high_raw, 1, 0)
+        grid.addWidget(card_high_conv, 1, 1)
+        grid.addWidget(card_low_raw, 2, 0)
+        grid.addWidget(card_low_conv, 2, 1)
         grid.addWidget(card_cs, 3, 0, 1, 2)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
         outer_layout.addLayout(grid)
 
         # --- Log lịch sử (chữ màu theo trạng thái, nền tối dễ đọc hex) ---
@@ -896,15 +868,13 @@ class SerialTerminal(QMainWindow):
         self._pending_usb_log_lines.clear()
         self.txt_usb_log.clear()
         self._usb_buffer = bytearray()
-        for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_checksum):
-            lbl.setText("--")
-            lbl.setStyleSheet("color: #2C3E50; font-size: 17px; font-weight: 700; border: none;")
-        for lbl in (self.lbl_val_high, self.lbl_val_low):
+        for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
+                    self.lbl_val_low, self.lbl_val_checksum):
             lbl.setText("--")
             lbl.setStyleSheet("color: #2C3E50; font-size: 15px; font-weight: 700; border: none;")
         for lbl in (self.lbl_conv_high, self.lbl_conv_low):
-            lbl.setText("")
-            lbl.setVisible(False)
+            lbl.setText("--")
+            lbl.setStyleSheet("color: #2E86C1; font-size: 15px; font-weight: 700; border: none;")
         self._set_usb_banner("neutral", "Chưa nhận frame nào", "")
 
     # ------------------------------------------------------------------ #
@@ -1133,11 +1103,9 @@ class SerialTerminal(QMainWindow):
 
         if sof == self.USB_SOF_ERROR:
             for lbl in (self.lbl_val_nodeid, self.lbl_val_cmd, self.lbl_val_high,
-                        self.lbl_val_low, self.lbl_val_checksum):
+                        self.lbl_val_low, self.lbl_val_checksum,
+                        self.lbl_conv_high, self.lbl_conv_low):
                 lbl.setText("--")
-            for lbl in (self.lbl_conv_high, self.lbl_conv_low):
-                lbl.setText("")
-                lbl.setVisible(False)
             self._set_usb_banner("error", "⚠ Error Frame nhận được", timestamp)
             self._pending_usb_log_lines.append(
                 f'<span style="color:#E74C3C;">[{timestamp}] LỖI</span> '
@@ -1170,24 +1138,13 @@ class SerialTerminal(QMainWindow):
             conv_high_str = self._convert_field(high4, field_cfg.get("high", {}), endian)
             conv_low_str = self._convert_field(low4, field_cfg.get("low", {}), endian)
 
-        if conv_high_str:
-            self.lbl_conv_high.setText(f"→ {conv_high_str}")
-            self.lbl_conv_high.setVisible(True)
-        else:
-            self.lbl_conv_high.setText("")
-            self.lbl_conv_high.setVisible(False)
-
-        if conv_low_str:
-            self.lbl_conv_low.setText(f"→ {conv_low_str}")
-            self.lbl_conv_low.setVisible(True)
-        else:
-            self.lbl_conv_low.setText("")
-            self.lbl_conv_low.setVisible(False)
+        self.lbl_conv_high.setText(conv_high_str if conv_high_str else "--")
+        self.lbl_conv_low.setText(conv_low_str if conv_low_str else "--")
 
         if is_ok:
             self.lbl_val_checksum.setText(f"0x{checksum_recv:02X}  ✓ OK")
             self.lbl_val_checksum.setStyleSheet(
-                "color: #1E8449; font-size: 17px; font-weight: 700; border: none;")
+                "color: #1E8449; font-size: 15px; font-weight: 700; border: none;")
             self._set_usb_banner("ok", "✓ Frame hợp lệ", timestamp)
             status_color = "#27AE60"
             status_str = "OK"
@@ -1195,7 +1152,7 @@ class SerialTerminal(QMainWindow):
             self.lbl_val_checksum.setText(
                 f"0x{checksum_recv:02X}  ✗ (tính được 0x{checksum_calc:02X})")
             self.lbl_val_checksum.setStyleSheet(
-                "color: #C0392B; font-size: 17px; font-weight: 700; border: none;")
+                "color: #C0392B; font-size: 15px; font-weight: 700; border: none;")
             self._set_usb_banner("error", "✗ Frame SAI checksum", timestamp)
             status_color = "#E74C3C"
             status_str = "SAI CHECKSUM"
