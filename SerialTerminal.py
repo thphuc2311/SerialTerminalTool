@@ -4,7 +4,7 @@ SerialTerminal.py
 Giao diện công cụ Serial Terminal (giống SSCOM/CoolTerm) dùng PyQt5 + pyserial.
 
 Cài đặt thư viện cần thiết:
-    pip install PyQt5 pyserial
+    pip install PyQt5 pyserial pyqtgraph
 
 Chạy:
     python SerialTerminal.py
@@ -16,6 +16,7 @@ import time
 import json
 import struct
 import binascii
+from collections import deque
 from datetime import datetime
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
@@ -25,7 +26,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QTextEdit, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QFileDialog, QAction, QActionGroup, QToolBar, QLineEdit, QSpinBox, QFrame,
     QSizePolicy, QMessageBox, QSplitter, QStackedWidget, QDialog, QListWidget,
-    QListWidgetItem, QDialogButtonBox
+    QListWidgetItem, QDialogButtonBox, QScrollArea
 )
 
 try:
@@ -34,6 +35,11 @@ try:
 except ImportError:
     serial = None
     list_ports = None
+
+try:
+    import pyqtgraph as pg
+except ImportError:
+    pg = None
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +146,14 @@ class CmdConfigDialog(QDialog):
         cmd_row.addWidget(self.edt_cmd)
         right_col.addLayout(cmd_row)
 
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel("Tên gợi nhớ:"))
+        self.edt_label = QLineEdit()
+        self.edt_label.setPlaceholderText("vd: Tốc độ, Vị trí, Dòng điện...")
+        self.edt_label.textChanged.connect(self._on_field_changed)
+        label_row.addWidget(self.edt_label)
+        right_col.addLayout(label_row)
+
         endian_row = QHBoxLayout()
         endian_row.addWidget(QLabel("Thứ tự byte:"))
         self.cmb_endian = QComboBox()
@@ -206,7 +220,9 @@ class CmdConfigDialog(QDialog):
         self.list_cmd.blockSignals(True)
         self.list_cmd.clear()
         for cmd in sorted(self._configs.keys()):
-            item = QListWidgetItem(f"0x{cmd:02X}")
+            label = self._configs[cmd].get("label", "").strip()
+            text = f"0x{cmd:02X} — {label}" if label else f"0x{cmd:02X}"
+            item = QListWidgetItem(text)
             item.setData(Qt.UserRole, cmd)
             self.list_cmd.addItem(item)
         self.list_cmd.blockSignals(False)
@@ -217,6 +233,7 @@ class CmdConfigDialog(QDialog):
         while new_cmd in self._configs and new_cmd < 0xFF:
             new_cmd += 1
         self._configs[new_cmd] = {
+            "label": "",
             "endian": "big",
             "high": {"type": "raw"},
             "low": {"type": "raw"},
@@ -249,6 +266,7 @@ class CmdConfigDialog(QDialog):
         cfg = self._configs.get(cmd, {})
         self._loading = True
         self.edt_cmd.setText(f"0x{cmd:02X}")
+        self.edt_label.setText(cfg.get("label", ""))
         idx = self.cmb_endian.findData(cfg.get("endian", "big"))
         self.cmb_endian.setCurrentIndex(max(idx, 0))
         self._load_field_group(cfg.get("high", {}), self.cmb_high_type, self.spin_high_byte, self.cmb_high_bit)
@@ -289,6 +307,7 @@ class CmdConfigDialog(QDialog):
         if getattr(self, "_loading", False) or self._current_cmd is None:
             return
         cfg = self._configs.setdefault(self._current_cmd, {})
+        cfg["label"] = self.edt_label.text().strip()
         cfg["endian"] = self.cmb_endian.currentData()
         cfg["high"] = {
             "type": self.cmb_high_type.currentData(),
@@ -330,6 +349,166 @@ class CmdConfigDialog(QDialog):
 
     def get_configs(self):
         return self._configs
+
+
+# --------------------------------------------------------------------------- #
+# Widget vẽ plot real-time, auto-scale theo dữ liệu đã convert
+# --------------------------------------------------------------------------- #
+class AutoScalePlotWidget(QWidget):
+    """Vẽ nhiều series (mỗi series = 1 đường) theo dạng cửa sổ trượt (giữ tối
+    đa max_points mẫu gần nhất mỗi series). Dùng pyqtgraph nên auto-scale cả
+    2 trục X/Y có sẵn (enableAutoRange), không cần tự tính min/max thủ công."""
+
+    # Bảng màu xoay vòng để tự gán cho series mới, không trùng nhau quá sớm
+    _PALETTE = ["#2E86C1", "#E74C3C", "#27AE60", "#F39C12", "#8E44AD",
+                "#16A085", "#D35400", "#2980B9"]
+
+    def __init__(self, max_points=300, parent=None):
+        super().__init__(parent)
+        self.max_points = max_points
+        self._buffers = {}      # tên series -> deque(maxlen=max_points) giá trị y
+        self._curves = {}       # tên series -> PlotDataItem
+        self._color_idx = 0
+        self._dirty = False     # có dữ liệu mới chưa vẽ lại hay không
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        if pg is None:
+            # Chưa cài pyqtgraph -> hiện thông báo thay vì crash
+            self._available = False
+            lbl = QLabel(
+                "Chưa cài pyqtgraph nên không thể vẽ plot.\n"
+                "Cài bằng lệnh: pip install pyqtgraph\n"
+                "rồi khởi động lại ứng dụng."
+            )
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("color: #C0392B; font-weight: bold; padding: 20px;")
+            layout.addWidget(lbl)
+            return
+
+        self._available = True
+        pg.setConfigOption("background", "#1E2227")
+        pg.setConfigOption("foreground", "#D5DBDD")
+
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.addLegend(offset=(10, 10))
+        self.plot_widget.enableAutoRange(axis="xy", enable=True)
+        self.plot_widget.setLabel("bottom", "Mẫu gần nhất")
+        layout.addWidget(self.plot_widget)
+
+    def _next_color(self):
+        color = self._PALETTE[self._color_idx % len(self._PALETTE)]
+        self._color_idx += 1
+        return color
+
+    def add_point(self, series_name: str, value: float):
+        """Thêm 1 điểm dữ liệu mới vào series (chưa vẽ ngay — chỉ đánh dấu
+        dirty, việc vẽ thật do flush_if_dirty() đảm nhiệm theo chu kỳ timer
+        để tránh redraw plot quá nhiều lần mỗi giây gây lag)."""
+        if not self._available:
+            return
+        buf = self._buffers.get(series_name)
+        if buf is None:
+            buf = deque(maxlen=self.max_points)
+            self._buffers[series_name] = buf
+        buf.append(value)
+        self._dirty = True
+
+    def flush_if_dirty(self):
+        """Vẽ lại tất cả series đã thay đổi kể từ lần flush trước. Gọi định
+        kỳ (vd mỗi 50-100ms) từ timer bên ngoài, không gọi mỗi khi có data."""
+        if not self._available or not self._dirty:
+            return
+        for name, buf in self._buffers.items():
+            curve = self._curves.get(name)
+            if curve is None:
+                color = self._next_color()
+                curve = self.plot_widget.plot(
+                    pen=pg.mkPen(color=color, width=2), name=name)
+                self._curves[name] = curve
+            ys = list(buf)
+            xs = list(range(len(ys)))
+            curve.setData(xs, ys)
+        self._dirty = False
+
+    def clear_all(self):
+        if not self._available:
+            return
+        self._buffers.clear()
+        for curve in self._curves.values():
+            self.plot_widget.removeItem(curve)
+        self._curves.clear()
+        self._color_idx = 0
+        self._dirty = False
+
+
+# --------------------------------------------------------------------------- #
+# Panel quản lý nhiều biểu đồ, mỗi CMD 1 biểu đồ riêng (tự tạo khi có dữ liệu
+# đầu tiên của CMD đó), xếp dọc trong khung cuộn được.
+# --------------------------------------------------------------------------- #
+class MultiCmdPlotPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._container = QWidget()
+        self._container_layout = QVBoxLayout(self._container)
+        self._container_layout.setSpacing(10)
+        self._container_layout.addStretch()  # giữ các panel dồn lên trên
+        self._scroll.setWidget(self._container)
+        outer.addWidget(self._scroll)
+
+        self._panels = {}  # cmd (int) -> {"group": QGroupBox, "plot": AutoScalePlotWidget}
+
+    def ensure_panel(self, cmd: int, title: str) -> "AutoScalePlotWidget":
+        """Trả về AutoScalePlotWidget ứng với CMD, tạo mới (kèm QGroupBox
+        riêng) nếu đây là lần đầu CMD này xuất hiện. Nếu panel đã tồn tại,
+        chỉ cập nhật lại tiêu đề (phòng khi người dùng đổi Tên gợi nhớ)."""
+        info = self._panels.get(cmd)
+        if info is None:
+            group = QGroupBox(title)
+            group_layout = QVBoxLayout(group)
+            plot = AutoScalePlotWidget(max_points=300)
+            plot.setMinimumHeight(220)
+            group_layout.addWidget(plot)
+
+            # Chèn phía trên dòng stretch cuối cùng, để panel mới luôn nằm
+            # ngay dưới các panel trước đó thay vì bị đẩy xuống cuối.
+            insert_at = max(0, self._container_layout.count() - 1)
+            self._container_layout.insertWidget(insert_at, group)
+
+            info = {"group": group, "plot": plot}
+            self._panels[cmd] = info
+        else:
+            info["group"].setTitle(title)
+        return info["plot"]
+
+    def flush_if_dirty(self):
+        for info in self._panels.values():
+            info["plot"].flush_if_dirty()
+
+    def clear_all(self):
+        """Xoá dữ liệu của tất cả panel (giữ nguyên khung/panel đã tạo)."""
+        for info in self._panels.values():
+            info["plot"].clear_all()
+
+    def has_panel(self, cmd: int) -> bool:
+        return cmd in self._panels
+
+    def prune_panels(self, valid_cmds: set):
+        """Xoá hẳn panel của CMD không còn trong cấu hình nữa (gọi sau khi
+        người dùng sửa CMD Config, để panel cũ không nằm lại vô ích)."""
+        to_remove = [cmd for cmd in self._panels if cmd not in valid_cmds]
+        for cmd in to_remove:
+            info = self._panels.pop(cmd)
+            self._container_layout.removeWidget(info["group"])
+            info["group"].setParent(None)
+            info["group"].deleteLater()
 
 
 # --------------------------------------------------------------------------- #
@@ -391,6 +570,8 @@ class SerialTerminal(QMainWindow):
             lambda checked: checked and self.stack_recv.setCurrentIndex(0))
         self.act_view_usb.toggled.connect(
             lambda checked: checked and self.stack_recv.setCurrentIndex(1))
+        self.act_view_plot.toggled.connect(
+            lambda checked: checked and self.stack_recv.setCurrentIndex(2))
         self.stack_recv.setCurrentIndex(0)
 
         # Timer tính tốc độ gửi/nhận (Byte/s)
@@ -426,20 +607,24 @@ class SerialTerminal(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Nút chuyển đổi View Serial / View USB (loại trừ lẫn nhau, kiểu radio)
+        # Nút chuyển đổi View Serial / View USB / View Plot (loại trừ lẫn nhau, kiểu radio)
         self.act_view_serial = QAction("View Serial", self)
         self.act_view_serial.setCheckable(True)
         self.act_view_usb = QAction("View USB", self)
         self.act_view_usb.setCheckable(True)
+        self.act_view_plot = QAction("View Plot", self)
+        self.act_view_plot.setCheckable(True)
 
         view_group = QActionGroup(self)
         view_group.setExclusive(True)
         view_group.addAction(self.act_view_serial)
         view_group.addAction(self.act_view_usb)
+        view_group.addAction(self.act_view_plot)
         self.act_view_serial.setChecked(True)  # mặc định khởi động: Serial view
 
         toolbar.addAction(self.act_view_serial)
         toolbar.addAction(self.act_view_usb)
+        toolbar.addAction(self.act_view_plot)
 
         toolbar.addSeparator()
 
@@ -657,9 +842,12 @@ class SerialTerminal(QMainWindow):
         # Stack để chuyển đổi Receive Section (Serial view) <-> USB View,
         # dữ liệu cả 2 bên vẫn luôn được cập nhật ngầm nên chuyển qua lại
         # không mất dữ liệu đã nhận trước đó.
+        plot_page = self._build_plot_view()
+
         self.stack_recv = QStackedWidget()
         self.stack_recv.addWidget(recv_box)   # index 0: Serial view
         self.stack_recv.addWidget(usb_page)   # index 1: USB view
+        self.stack_recv.addWidget(plot_page)  # index 2: Plot view
         layout.addWidget(self.stack_recv, 2)
 
         # --- Send Section ---
@@ -856,6 +1044,37 @@ class SerialTerminal(QMainWindow):
         self.lbl_usb_status.setText(text)
         self.lbl_usb_timestamp.setText(timestamp)
 
+    # ---- Plot View: vẽ auto-scale các giá trị đã convert theo thời gian ---- #
+    def _build_plot_view(self):
+        box = QGroupBox("Plot View — mỗi CMD 1 biểu đồ riêng")
+        layout = QVBoxLayout(box)
+
+        hint = QLabel(
+            "Mỗi CMD có cấu hình kiểu dữ liệu số (khác Raw) trong CMD Config sẽ "
+            "tự có 1 biểu đồ riêng, đặt tên theo 'Tên gợi nhớ' bạn đặt (vd: Tốc "
+            "độ, Vị trí, Dòng điện). Biểu đồ chỉ xuất hiện sau khi nhận được "
+            "frame đầu tiên của CMD đó."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5D6D7E; font-size: 11px;")
+        layout.addWidget(hint)
+
+        self.plot_panel = MultiCmdPlotPanel()
+        layout.addWidget(self.plot_panel, 1)
+
+        btn_clear_plot = QPushButton("Clear Plot")
+        btn_clear_plot.clicked.connect(self._clear_plot_view)
+        layout.addWidget(btn_clear_plot)
+
+        return box
+
+    def _clear_plot_view(self):
+        self.plot_panel.clear_all()
+
+    def _cmd_display_title(self, cmd: int) -> str:
+        label = self.cmd_configs.get(cmd, {}).get("label", "").strip()
+        return f"{label}  (CMD 0x{cmd:02X})" if label else f"CMD 0x{cmd:02X}"
+
     def _clear_all_logs(self):
         """Xoá log ở cả 2 view: text nhận của Serial view và frame log của USB view."""
         self._pending_raw_text.clear()
@@ -863,6 +1082,7 @@ class SerialTerminal(QMainWindow):
         self._recv_char_count = 0
         self.txt_receive.clear()
         self._clear_usb_view()
+        self._clear_plot_view()
 
     def _clear_usb_view(self):
         self._pending_usb_log_lines.clear()
@@ -1043,6 +1263,21 @@ class SerialTerminal(QMainWindow):
             self.lbl_recv_count.setText(str(self.recv_count))
             self._recv_count_dirty = False
 
+        # Vẽ lại Plot View (nếu có điểm mới) — cùng 1 nhịp timer, tránh vẽ
+        # lại biểu đồ mỗi khi có 1 frame đến (gây lag khi tần suất frame cao).
+        self.plot_panel.flush_if_dirty()
+
+    def _push_plot_values(self, cmd: int, field_name: str, raw4: bytes, field_cfg: dict, endian: str):
+        """Đẩy giá trị số đã convert của 1 field (High/Low) vào biểu đồ riêng
+        của CMD này (tự tạo nếu chưa có). Bỏ qua nếu field đang để Raw."""
+        values = self._convert_field_values(raw4, field_cfg, endian)
+        if not values:
+            return
+        plot = self.plot_panel.ensure_panel(cmd, self._cmd_display_title(cmd))
+        for suffix, val in values:
+            series_name = f"{field_name}{suffix}"
+            plot.add_point(series_name, val)
+
     def _trim_text_edit_if_needed(self, text_edit):
         """Giữ nội dung ô text không vượt quá MAX_RECV_CHARS (giống đúng cái
         nhãn 'Byte<128KB' đã ghi sẵn trên giao diện) — xóa bớt phần cũ nhất
@@ -1141,6 +1376,12 @@ class SerialTerminal(QMainWindow):
         self.lbl_conv_high.setText(conv_high_str if conv_high_str else "--")
         self.lbl_conv_low.setText(conv_low_str if conv_low_str else "--")
 
+        # Đẩy giá trị số vào Plot View — chỉ khi checksum đúng, tránh vẽ
+        # nhiễu từ frame lỗi; mỗi (CMD, field, phần tử) là 1 series riêng.
+        if field_cfg and is_ok:
+            self._push_plot_values(cmd, "High", high4, field_cfg.get("high", {}), field_cfg.get("endian", "big"))
+            self._push_plot_values(cmd, "Low", low4, field_cfg.get("low", {}), field_cfg.get("endian", "big"))
+
         if is_ok:
             self.lbl_val_checksum.setText(f"0x{checksum_recv:02X}  ✓ OK")
             self.lbl_val_checksum.setStyleSheet(
@@ -1170,9 +1411,12 @@ class SerialTerminal(QMainWindow):
         )
 
     @staticmethod
-    def _convert_field(raw4: bytes, field_cfg: dict, endian: str):
+    def _convert_field_values(raw4: bytes, field_cfg: dict, endian: str):
         """Convert 4 byte raw sang kiểu dữ liệu theo field_cfg (xem CmdConfigDialog).
-        Trả về chuỗi hiển thị, hoặc None nếu type='raw' (không cần hiển thị thêm)."""
+        Trả về list [(nhãn_phụ, giá_trị_số), ...] — ví dụ:
+            int32/uint32/float32/bool -> 1 phần tử: [("", value)]
+            int16x2/uint16x2          -> 2 phần tử: [("[0]", v1), ("[1]", v2)]
+        Trả về None nếu type='raw' (không convert) hoặc lỗi unpack."""
         ftype = field_cfg.get("type", "raw")
         if not ftype or ftype == "raw":
             return None
@@ -1180,34 +1424,61 @@ class SerialTerminal(QMainWindow):
         prefix = ">" if endian == "big" else "<"
         try:
             if ftype == "int32":
-                val = struct.unpack(prefix + "i", raw4)[0]
-                return f"int32: {val}"
+                return [("", float(struct.unpack(prefix + "i", raw4)[0]))]
             if ftype == "uint32":
-                val = struct.unpack(prefix + "I", raw4)[0]
-                return f"uint32: {val}"
+                return [("", float(struct.unpack(prefix + "I", raw4)[0]))]
             if ftype == "float32":
-                val = struct.unpack(prefix + "f", raw4)[0]
-                return f"float32: {val:.6g}"
+                return [("", float(struct.unpack(prefix + "f", raw4)[0]))]
             if ftype == "int16x2":
                 v1, v2 = struct.unpack(prefix + "2h", raw4)
-                return f"int16[2]: {v1}, {v2}"
+                return [("[0]", float(v1)), ("[1]", float(v2))]
             if ftype == "uint16x2":
                 v1, v2 = struct.unpack(prefix + "2H", raw4)
-                return f"uint16[2]: {v1}, {v2}"
+                return [("[0]", float(v1)), ("[1]", float(v2))]
             if ftype == "bool":
                 byte_idx = max(0, min(3, field_cfg.get("byte_index", 3)))
                 bit_idx = max(0, min(7, field_cfg.get("bit_index", 7)))
-                bit_val = bool((raw4[byte_idx] >> bit_idx) & 0x01)
-                return f"bool (byte{byte_idx}.bit{bit_idx}): {bit_val}"
-        except Exception as e:
-            return f"lỗi convert ({e})"
+                bit_val = (raw4[byte_idx] >> bit_idx) & 0x01
+                return [("", float(bit_val))]
+        except Exception:
+            return None
         return None
+
+    def _convert_field(self, raw4: bytes, field_cfg: dict, endian: str):
+        """Chuỗi hiển thị cho 1 field — dựng từ _convert_field_values() để
+        đảm bảo số hiển thị trên UI và số đưa vào plot luôn khớp nhau."""
+        ftype = field_cfg.get("type", "raw")
+        if not ftype or ftype == "raw":
+            return None
+        values = self._convert_field_values(raw4, field_cfg, endian)
+        if values is None:
+            return "lỗi convert"
+
+        if ftype == "bool":
+            byte_idx = max(0, min(3, field_cfg.get("byte_index", 3)))
+            bit_idx = max(0, min(7, field_cfg.get("bit_index", 7)))
+            return f"bool (byte{byte_idx}.bit{bit_idx}): {bool(values[0][1])}"
+        if ftype in ("int16x2", "uint16x2"):
+            base = "int16" if ftype == "int16x2" else "uint16"
+            v1, v2 = int(values[0][1]), int(values[1][1])
+            return f"{base}[2]: {v1}, {v2}"
+        if ftype == "float32":
+            return f"float32: {values[0][1]:.6g}"
+        # int32 / uint32
+        return f"{ftype}: {int(values[0][1])}"
 
     def _open_cmd_config_dialog(self):
         dlg = CmdConfigDialog(self.cmd_configs, self)
         if dlg.exec_() == QDialog.Accepted:
             self.cmd_configs = dlg.get_configs()
             self._save_cmd_configs()
+            # Dọn panel của CMD đã bị xoá, và cập nhật tên cho panel đã đổi
+            # "Tên gợi nhớ" — để Plot View phản ánh đúng ngay, không cần đợi
+            # frame mới đến mới refresh tiêu đề.
+            self.plot_panel.prune_panels(set(self.cmd_configs.keys()))
+            for cmd in self.cmd_configs:
+                if self.plot_panel.has_panel(cmd):
+                    self.plot_panel.ensure_panel(cmd, self._cmd_display_title(cmd))
 
     def _load_cmd_configs(self) -> dict:
         """Tự động tải cấu hình CMD từ file JSON cạnh script (nếu có)."""
