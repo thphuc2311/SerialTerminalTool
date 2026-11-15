@@ -512,6 +512,48 @@ class MultiCmdPlotPanel(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Cửa sổ popup riêng cho Plot View — mở rộng, dễ nhìn hơn tab hẹp trong app
+# --------------------------------------------------------------------------- #
+class PlotPopupWindow(QMainWindow):
+    """Cửa sổ độc lập hiển thị MultiCmdPlotPanel ở kích thước lớn. Dữ liệu
+    vẫn được đẩy từ luồng chính (cùng instance plot_panel), nên plot trong
+    popup luôn đồng bộ real-time với dữ liệu mới nhận được."""
+
+    closed = pyqtSignal()
+
+    def __init__(self, plot_panel: "MultiCmdPlotPanel", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Plot View — Cửa sổ riêng")
+        self.resize(1000, 700)
+        self.plot_panel = plot_panel  # dùng chung instance, không tạo bản sao
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        hint = QLabel(
+            "Mỗi CMD có 1 biểu đồ riêng (chỉ vẽ field High). "
+            "Đóng cửa sổ này để quay lại tab chính."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #5D6D7E; font-size: 11px; padding: 4px;")
+        layout.addWidget(hint)
+
+        layout.addWidget(self.plot_panel, 1)
+
+        btn_row = QHBoxLayout()
+        btn_clear = QPushButton("Clear Plot")
+        btn_clear.clicked.connect(self.plot_panel.clear_all)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_clear)
+        layout.addLayout(btn_row)
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        event.accept()
+
+
+# --------------------------------------------------------------------------- #
 # Cửa sổ chính
 # --------------------------------------------------------------------------- #
 class SerialTerminal(QMainWindow):
@@ -534,6 +576,7 @@ class SerialTerminal(QMainWindow):
         self.last_send_count = 0
         self.last_recv_count = 0
         self._usb_buffer = bytearray()  # buffer gom byte để tách frame USB
+        self._plot_popup = None  # cửa sổ popup plot (None khi chưa mở)
 
         # Hàng chờ phục vụ batching: dữ liệu được xếp vào đây ngay khi nhận,
         # còn việc vẽ lên GUI do timer _flush_receive_display() đảm nhiệm
@@ -1062,14 +1105,58 @@ class SerialTerminal(QMainWindow):
         self.plot_panel = MultiCmdPlotPanel()
         layout.addWidget(self.plot_panel, 1)
 
+        btn_row = QHBoxLayout()
         btn_clear_plot = QPushButton("Clear Plot")
         btn_clear_plot.clicked.connect(self._clear_plot_view)
-        layout.addWidget(btn_clear_plot)
+        self.btn_popout_plot = QPushButton("Popout Plot")
+        self.btn_popout_plot.clicked.connect(self._open_plot_popup)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_clear_plot)
+        btn_row.addWidget(self.btn_popout_plot)
+        layout.addLayout(btn_row)
 
         return box
 
     def _clear_plot_view(self):
         self.plot_panel.clear_all()
+
+    def _open_plot_popup(self):
+        """Mở plot_panel trong cửa sổ popup riêng (rộng hơn, dễ nhìn). Khi
+        popup đang mở, plot_panel được chuyển sang popup; khi đóng popup,
+        plot_panel được trả lại tab chính."""
+        if self._plot_popup is not None:
+            self._plot_popup.raise_()
+            self._plot_popup.activateWindow()
+            return
+        self._plot_popup = PlotPopupWindow(self.plot_panel, self)
+        self._plot_popup.closed.connect(self._close_plot_popup)
+        self.btn_popout_plot.setEnabled(False)
+        self._plot_popup.show()
+
+    def _close_plot_popup(self):
+        """Được gọi khi popup đóng — trả plot_panel về lại tab Plot View."""
+        if self._plot_popup is None:
+            return
+        # Lấy lại plot_panel trước khi đóng
+        popup = self._plot_popup
+        self._plot_popup = None
+        # Trả plot_panel về layout của tab chính
+        # (plot_panel vẫn là cùng instance, chỉ đổi parent)
+        self.plot_panel.setParent(self.stack_recv.widget(2))
+        # Thêm lại vào layout nếu bị gỡ ra khi đưa sang popup
+        box_layout = self.stack_recv.widget(2).layout()
+        # Tìm vị trí hiện tại — nếu đã bị gỡ, thêm lại
+        if self.plot_panel.parent() is not None:
+            # Kiểm tra xem plot_panel có còn trong layout không
+            found = False
+            for i in range(box_layout.count()):
+                if box_layout.itemAt(i) is not None and box_layout.itemAt(i).widget() is self.plot_panel:
+                    found = True
+                    break
+            if not found:
+                box_layout.insertWidget(1, self.plot_panel)
+        popup.deleteLater()
+        self.btn_popout_plot.setEnabled(True)
 
     def _cmd_display_title(self, cmd: int) -> str:
         label = self.cmd_configs.get(cmd, {}).get("label", "").strip()
@@ -1267,15 +1354,16 @@ class SerialTerminal(QMainWindow):
         # lại biểu đồ mỗi khi có 1 frame đến (gây lag khi tần suất frame cao).
         self.plot_panel.flush_if_dirty()
 
-    def _push_plot_values(self, cmd: int, field_name: str, raw4: bytes, field_cfg: dict, endian: str):
-        """Đẩy giá trị số đã convert của 1 field (High/Low) vào biểu đồ riêng
-        của CMD này (tự tạo nếu chưa có). Bỏ qua nếu field đang để Raw."""
+    def _push_plot_values(self, cmd: int, raw4: bytes, field_cfg: dict, endian: str):
+        """Đẩy giá trị số đã convert của field High vào biểu đồ riêng của CMD
+        này (tự tạo nếu chưa có). Bỏ qua nếu field đang để Raw.
+        Chỉ vẽ field High theo yêu cầu — field Low không được vẽ."""
         values = self._convert_field_values(raw4, field_cfg, endian)
         if not values:
             return
         plot = self.plot_panel.ensure_panel(cmd, self._cmd_display_title(cmd))
         for suffix, val in values:
-            series_name = f"{field_name}{suffix}"
+            series_name = f"High{suffix}"
             plot.add_point(series_name, val)
 
     def _trim_text_edit_if_needed(self, text_edit):
@@ -1377,10 +1465,9 @@ class SerialTerminal(QMainWindow):
         self.lbl_conv_low.setText(conv_low_str if conv_low_str else "--")
 
         # Đẩy giá trị số vào Plot View — chỉ khi checksum đúng, tránh vẽ
-        # nhiễu từ frame lỗi; mỗi (CMD, field, phần tử) là 1 series riêng.
+        # nhiễu từ frame lỗi; chỉ vẽ field High (field Low không vẽ theo yêu cầu).
         if field_cfg and is_ok:
-            self._push_plot_values(cmd, "High", high4, field_cfg.get("high", {}), field_cfg.get("endian", "big"))
-            self._push_plot_values(cmd, "Low", low4, field_cfg.get("low", {}), field_cfg.get("endian", "big"))
+            self._push_plot_values(cmd, high4, field_cfg.get("high", {}), field_cfg.get("endian", "big"))
 
         if is_ok:
             self.lbl_val_checksum.setText(f"0x{checksum_recv:02X}  ✓ OK")
