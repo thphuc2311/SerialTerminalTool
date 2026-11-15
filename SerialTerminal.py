@@ -1128,6 +1128,10 @@ class SerialTerminal(QMainWindow):
             self._plot_popup.raise_()
             self._plot_popup.activateWindow()
             return
+        # Gỡ plot_panel khỏi layout tab chính (không xoá widget, chỉ rút khỏi layout)
+        main_layout = self.stack_recv.widget(2).layout()
+        main_layout.removeWidget(self.plot_panel)
+        # Tạo popup — PlotPopupWindow.__init__ sẽ addWidget(plot_panel) vào layout riêng
         self._plot_popup = PlotPopupWindow(self.plot_panel, self)
         self._plot_popup.closed.connect(self._close_plot_popup)
         self.btn_popout_plot.setEnabled(False)
@@ -1137,24 +1141,14 @@ class SerialTerminal(QMainWindow):
         """Được gọi khi popup đóng — trả plot_panel về lại tab Plot View."""
         if self._plot_popup is None:
             return
-        # Lấy lại plot_panel trước khi đóng
         popup = self._plot_popup
         self._plot_popup = None
-        # Trả plot_panel về layout của tab chính
-        # (plot_panel vẫn là cùng instance, chỉ đổi parent)
-        self.plot_panel.setParent(self.stack_recv.widget(2))
-        # Thêm lại vào layout nếu bị gỡ ra khi đưa sang popup
-        box_layout = self.stack_recv.widget(2).layout()
-        # Tìm vị trí hiện tại — nếu đã bị gỡ, thêm lại
-        if self.plot_panel.parent() is not None:
-            # Kiểm tra xem plot_panel có còn trong layout không
-            found = False
-            for i in range(box_layout.count()):
-                if box_layout.itemAt(i) is not None and box_layout.itemAt(i).widget() is self.plot_panel:
-                    found = True
-                    break
-            if not found:
-                box_layout.insertWidget(1, self.plot_panel)
+        # Gỡ plot_panel khỏi layout popup trước khi đóng popup
+        popup_layout = popup.centralWidget().layout()
+        popup_layout.removeWidget(self.plot_panel)
+        # Thêm lại vào layout tab chính tại vị trí cũ (index 1: giữa hint và btn_row)
+        main_layout = self.stack_recv.widget(2).layout()
+        main_layout.insertWidget(1, self.plot_panel)
         popup.deleteLater()
         self.btn_popout_plot.setEnabled(True)
 
